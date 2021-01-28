@@ -1,0 +1,277 @@
+---
+title: "Logg Mlogit for Dronedata"
+author: "Guri Sogn Andersen"
+date: "14 10 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(tidyverse)
+require(DT)
+require(rgdal)
+require(readxl)
+require(corrplot)
+require(dismo)
+require(caret)
+require(e1071)
+require(pROC)
+```
+
+# Bakgrunn
+
+Datasettene som brukes i dette modelleringsarbeidet stammer fra feltarbeid og droneflyginger ved Akerøya i Ytre Hvaler Nasjonalpark. I tillegg har vi ground truth data fra Bolærne og fra bilder av enkeltarter. Det er også gjort et forsøk på å supplere med punkter som er bestemt utfra bilder. Det finnes store områder som er digitalisert (James og Harry har gjort dette), men jeg har ikke tilgang til disse dataene nå. Vi forsøker uten disse for å holde utviklingen av de to metodene litt adskilt (ML vs mlogit). Slik jeg ser det er mlogit-delen et "lilleputt-prosjekt" som vi gjennomfører for læringens del. Kanskje vil noe av dette kunne brukes videre i utviklingen av ML-teknikker. **Det er uklart hvorvidt disse datasettene kan kombineres uten problemer.** 
+
+Arbeidet bygger videre på metodikk og data som ble benyttet i forbindelse med Henry Simmons (intern) oppgave ved NIVA i 2019. Det foregår parallelt med utvikling av ML-teknikker (James Sample og co). 
+
+# Data
+
+Ground truth datasettet fra Akerøya er relativt lite og har relativt få kategorier:
+```{r}
+akeroya <- read.csv("./Ground truth/akeroydronedata.csv")
+datatable(akeroya, options = list(pageLength = 5))
+
+akeroya %>% group_by(Sp04_la) %>% summarise(n = n())
+```
+
+Det finnes flere kategorier i datasettet fra Bolærne, som muligens kan supplere data fra Akerøya. Men registreringene innenfor de fleste kategorier er likevel få. Jeg tror det er lurt å fokusere på Akerøya i denne omgang.
+
+```{r}
+bolaerne <- read.csv("./Ground truth/bolaerne light data.csv")
+datatable(bolaerne, options = list(pageLength = 5))
+
+bolaerne %>% group_by(Sp04_la) %>% summarise(n = n())
+```
+
+Så har jeg forsøkt å supplere med "ground truth"-punkter bestemt utifra bilder for Akerøya. Jeg kjørte et skript for å lage et "stratified random sample" datasett med punkter i QGIS basert på prediksjoner fra modellen Harry lagde. Deretter zoomet jeg inn på hvert punkt og bestemte det jeg så på bilde så langt det lot seg gjøre. Jeg la også til noen punkter som jeg kunne se at var nyttige å få med (eks. tydelige flekker av grønnalger etc). Dette er derfor et "semi-objektivt" datasett ... Det kan hjelpe i utviklingen av modellen fordi det er inkludert flere punkter med terrestrisk vegetasjon enn i hoveddatasettet... 
+
+**Det kunne kanskje vært en god idé å sample ved hjelp ab cLHS (conditional Latin Hyper Square) for å sikre at variabelrommet fanges opp på en lite subjektiv måte....?**
+
+```{r}
+akeroya_manual <- readOGR(dsn = "Ground truth", layer = "manualtest_classified")
+akeroya_manual@data %>% group_by(man_cat) %>% summarise(N = n())
+```
+
+Det ble også ekstrahert signaldata fra bilder av enkeltdata. Data ser slik ut:
+
+```{r}
+singlespec <- read_xlsx("./Pixelextracts/single species pixel values.xlsx")
+singlespec %>% group_by(species) %>% summarise(N = n())
+```
+
+Det er mange punkter, men det ser ikke umiddelbart ut som dette er så lett å forene med signaler fra dronebildene. Har derfor besluttet å utsette også dette trinnet til et senere tidspunkt.
+
+# Ekstrahering av signaler fra dronedata
+
+Test der jeg sammenlignet data jeg selv ekstraherte og data som Harry har ekstrahert fra Akerøya var noenlunde sammenfallende. Usikker på hva avvikene skyldes (kanskje bruk av buffer?). Velger derfor å starte fra scratch og ekstrahere egne data fra Akerøy (eneste området jeg har dronebilder fra). Ifølge Kasper ble det forsøkt valgt ut patcher med "enhetlig" natur (f.eks. klase med grisetang) på ca en halvmeter i diameter. Tenker derfor å forsøke å ekstrahere alle pixler innenfor en diameter på 40 cm (buffer radius = 0.2 m)...
+
+Samme øvelse kan gjøres på supplerende punkter fra Akerøy (bestemt utfra bilder) for å legge til kategorier det er mye av i bildene (som f.eks. strandsiv, lyng og gress). Tror imidlertid det kan være lurt å kutte algene fra denne, siden det er vanskelig å bestemme art på bildene (f.eks. vanskelig å skille fucus-artene).
+
+Dette er utført i eget script: Se *BufferExtractAkerøy.R*
+
+Resultat med buffer 40 cm:
+```{r}
+akeroya_bext <- read.csv("./Ground truth/akeroya_buffer20_extract.csv")
+datatable(akeroya_bext, options = list(pageLength = 5))
+
+manual_bext <- read.csv("./Ground truth/manual_buffer20_extract.csv")
+datatable(manual_bext, options = list(pageLength = 5))
+```
+
+# Tyde signaler fra dronedata
+
+Før modelleringen iverksettes er det nyttig å ta en titt på signalene som plukkes opp fra de ulike naturkategoriene. Sp04_la er det mest detaljerte nivået i ground truth datasettet fra Akerøya. Bolærne-datasettet har inkludert flere kategorier,  f.eks ålegras og grisetang, som ikke finnes i de andre settene.
+
+```{r}
+signals_gt <- akeroya_bext %>% rename(Category = Sp04_la) %>% dplyr::select(Category, blue:red) %>% mutate(Dataset = "GT", Level = "Sp04_la") 
+
+signals_aker <- manual_bext %>% rename(Category = man_cat) %>% dplyr::select(Category, blue:red) %>% mutate(Dataset = "Man") %>% full_join(signals_gt) %>% mutate(Category = str_to_sentence(Category))
+
+signals_aker %>% group_by(Category) %>% summarise(N = n())
+
+# Writing to file
+# write.csv(signals_aker, file = "./Pixelextracts/signals_aker.csv", row.names = FALSE)
+```
+
+Here goes:
+```{r fig.height = 10, fig.width = 8}
+signals_aker %>% pivot_longer(cols = blue:red, names_to = "Channel", values_to = "Signal") %>%
+  filter(Category != "") %>% 
+  ggplot(aes(x = Category, y = Signal)) +
+  geom_jitter(aes(colour = Category)) +
+  geom_boxplot(alpha = 0.2) +
+  facet_wrap(~ Channel) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0))
+```
+
+Noen klasser har signlaer som fordeles i ulike grupper. Eksempler er "Rock", "Sand", og "Roof" som har tydelige grupperinger i signalstyrke fra de ulike kanalene.
+
+I modelleringen vi gjorde med Harry, ble disse kategoriene splittet opp (Rock ble f.eks. til RockA og RockB). Her forsøker vi å unngå dette, og ser på utfallet av å modellere på datasett som ikke er bearbeidet på denne måten.
+
+Hvordan ser signalene ut når man sammenligner bilder fra Akerøya og Bolærene? Hvordan ser det ut for single species?
+
+```{r}
+a.df <- akeroya %>% mutate(Dataset = "akeroy") %>% dplyr::select(X, ID, latitude, longitude, Environ:Dataset) %>% 
+  rename_with(., ~ gsub("akeroy.", "", .x)) 
+names(a.df)[c(13,14)] <- c("nir", "red") 
+
+b.df <- bolaerne %>% mutate(Dataset = "bolaer") %>% dplyr::select(X, ID, latitude, longitude, Environ:Dataset)
+names(b.df) <- names(a.df)
+
+names(a.df)
+names(b.df)
+
+frisk_dataset <- full_join(a.df, b.df)
+summary(frisk_dataset)
+
+# Ground truth and signals
+frisk_dataset %>% dplyr::select(Dataset, Sp04_la, blue:red.edge) %>% 
+  pivot_longer(cols = blue:red.edge, names_to = "Channel", values_to = "Signal") %>% 
+  mutate(Sp04_la = str_to_sentence(Sp04_la)) %>% 
+  filter(Channel == "nir") %>% 
+  ggplot(aes(x = Dataset, y = Signal, fill = Dataset)) +
+  geom_boxplot() +
+  facet_wrap(~ Sp04_la)
+
+# Single spec and signals
+singlespec %>% pivot_longer(cols = blue:nir, names_to = "Channel", values_to = "Signal") %>% 
+  ggplot(aes(x = species, y = Signal, fill = species)) +
+  geom_boxplot() +
+  facet_wrap(~ Channel) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0))
+
+
+```
+
+Forskjellen gjør meg litt skeptisk til å blande dette sammen på dette stadiet. Jeg har imidlertid laget en modell basert på samlet datasett for Akerøya og Bolærne og testet prediksjoner på et lite utsnitt av Akerøya. Dette ligger under mappen som heter Utsnitt A. "Single species" har jeg foreløpig holdt helt utenfor.
+
+# Noen mulige veier videre:
+
+- [x] Tilpasse modell på 4/5 av fullt Akerøya-datasett, deretter validere med de resterende 1/5, deretter predikere og validere på GT-datasett fra Bolærene
+- [x] Supplere datasett fra Bolærene på samme måte som Akerøya, og lage en separat modell for Bolærne. **Dette viste seg å være vanskelig å få til fordi oppløsningen på Dronebildene er dårligere enn for Akerøya.**
+- [x] Ekstrahere signaler med buffer også fra Bolærne, tilpasse modell på 4/5 av fullt Akerøya + Bolærne datasett, deretter validere med de resterende 1/5 av data. **Modellen er litt dårligere, men overfladisk sett ser prediksjonene nokså like ut som for modell der kun Akerøya-data er inkludert - se Utsnitt A** 
+- [ ] Inkludere ekstrahering av signaler fra artsbilder (eget datasett) i treningen av onvenfor nevnte alternativer (får med mer grisetang og ålegras ...)?
+
+
+# Tilpass modell på Akerøya-sett (GT + manuell)
+
+Det ble laget en klassifiseringsmodell basert på alle data fra Akerøya (GT + manuelle), der signalverdier var trukket ut med en bufferradius på 20 cm (= 40 cm diameter), og de fem kanalene (green, blue, nir, red og rededge) ble benyttet som forklaringsvariabler. Dette ble gjort fordi punktene i felt er satt slik at bestemt naturklasse skal dekke en sirkel med minimum 25 cm radius rundt punktet. Ved å ekstrahere verdier innen buffer, fikk vi med mer av variasjon i signalstyrke plukket opp av de ulike kanalene for den gitte naturklassen. Som respons brukte vi i første omgang den mest detaljerte klassifiseringen. (Vist i tabeller over.) **Dette bør vurderes omgjort til aggregerte klasser (f.eks. ved sammenslåing av brunalger)**
+
+Klassifiseringsmodellen var av type multinomisk logistisk regressjon (mlogit). 4/5 av datasettet ble brukt i tilpasning av modellen, mens 1/5 ble holdt av til uavhengig test. 
+
+Etter korellasjonstester av settet med forklaringsvariabler, ble rededge kuttet fra settet. Strukturen i prediktoren ble da seende slik ut: blue + green + nir + red + blue:nir + green:nir + red:nir. Vi inkluderte altså signaler fra blue, green, near infrared og red, samt interaksjoner mellom nir og de resterende. Interaksjoner ble kun inkludert der korrelasjonen mellom de to variablene var < 0.7.
+
+Modelleringen er utført i eget skript: Se *Mlogit.R*
+
+```{r}
+model_data <- signals_aker %>% filter(Category != "") %>% filter(!is.na(blue))
+# Checking for colinearity
+model_data %>% dplyr::select(blue:red) %>% cor(.) %>% 
+  corrplot.mixed(.)
+# removing rededge
+# adding interactions with corr coeff < 0.7
+```
+
+# Validering av modell på testdata (subset av data som ikke er inkludert i tilpassing av modellen)
+
+Det ble holdt av 1/5 av data for testing av modellen. Denne testingen sier noe om hvor godt teknikken vi har brukt for å klassifisere dronebildene fungerer. Testene viser at teknikken fungerer godt i analyser av bilder fra Akerøya. Teknikken fungerer bedre for enkelte naturkategorier (f.eks. brunalger og gress) enn for andre (f.eks strandsiv og lyngplanter):
+
+```{r}
+testval <- read.csv("./Validering/testval.csv")
+
+testval %>% 
+  mutate(Predcat = gsub("\\.", " ", Predcat)) %>% 
+  ggplot(aes(x = Category, fill = Predcat)) +
+  geom_bar() +
+  labs(title = "Predicted outcome in relation to observations", x ="Observed", fill = "Predicted") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0))
+
+testval %>%
+  mutate(Predcat = gsub("\\.", " ", Predcat)) %>% 
+  mutate(Hit = ifelse(Category == Predcat, TRUE, FALSE)) %>% 
+  ggplot(aes(Category, fill = Hit)) +
+  geom_bar(alpha = 0.7) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title = "Exact prediction in relation to observations", x ="Observed", fill = "Predicted")
+
+```
+
+### Confusion matrix og multiclass ROC
+
+Som mål på hvor god den anvendte teknikken er til å skille ut de ulike naturkategoriene, brukes analyser av prediksjonene fra modellen og en såkalt "confusion matrix" basert som viser observasjoner sett i forhold til modellklassifisering. Vi beregnet en overordnet AUC («Area Under the reciever operating Curve») for hele modellen ved hjelp av funksjonen multiclass.roc som finnes i R-pakken pROC (Xavier et al., 2011). Videre benyttet vi funksjonen confusionMatrix som finnes i caret-pakken (Kuhn, 2020) til å beregne blant annet «balansert nøyaktighet» (Balanced Accuracy) for prediksjon av hver klasse. 
+
+AUC for modellen var 0.96, som viser at modellen er god. Helt konkret betyr det at sjansen for at modellen predikerer riktig når hver enkelt natruklasse betraktes for seg er 96 %. (Det lages i realiteten ett heldekkende kart per naturkategori som sier noe om sannsynlighet for forekomst basert på bildene.) Balansert nøyaktighet sier noe om modellens evne til å predikere riktig utfall, dvs. riktig bunnklasse blant alle valgmuligheter i hver celle i kartet. Dette er med andre ord bedre egnet til å vurdere hvor godt klassifiseringen treffer. 
+
+Resultatene av testen på de resterende 1/5 av datapunktene, viser at klassifiseringsteknikken treffer godt på f.eks. sand, rødalger, lav og gress, men dårlig på f.eks. strandsiv. Generelt treffer var resultatene gode for de aller fleste kategoriene.
+
+```{r}
+confusedata <- testval %>% 
+  mutate(Predcat = gsub("\\.", " ", Predcat)) %>%  
+  mutate(id = row.names(.)) %>% 
+  pivot_longer(cols = c(Category, Predcat), names_to = "Variable") %>% 
+  mutate(value2 = as.factor(value)) %>% 
+  pivot_wider(id_cols = id, names_from = Variable, values_from = value2) %>% 
+  data.frame()
+
+head(confusedata)
+str(confusedata)
+
+results <- confusionMatrix(confusedata$Category, confusedata$Predcat)
+results
+
+# Some tables :
+
+as.table(results)
+as.matrix(results, what = "overall")
+as.matrix(results, what = "classes")
+
+as.matrix(results, what = "classes") %>% data.frame() %>% 
+  rownames_to_column("Stat") %>%  
+  filter(Stat == "Balanced Accuracy") %>% 
+  pivot_longer(cols = `Bladder.wrack`:`Tangvoll`, values_to = "Balanced Accuracy", names_to = "Category") %>% 
+  ggplot() +
+  ylim(0,1) +
+  coord_flip() +
+  geom_col(aes(x = Category, y = `Balanced Accuracy`, fill = Category)) +
+  labs(x = "Naturkategori") +
+  theme(legend.position = "none")
+
+# Multiclass ROC ----------------------------------------------------------
+test.m1 <- read.csv("./Models/test_m1.csv")
+colnames(test.m1) <- gsub("\\.", " ", colnames(test.m1)) 
+mROC <- multiclass.roc(testval$Category, test.m1)
+mROC
+
+# multiclass AUC: 0.9601 :-)
+
+```
+
+# Predikering og validering av modell fra Akerøya til annet område (Bolærne)
+
+Denne øvelsen finnes i eget skript: *BolaerneClassify_M1.R*
+Resultatene var ikke gode, antagelig mye fordi det er forskjellig natur i de to områdene.(I hvertfall slik det ser ut i datasettene.)
+
+# Modell for Bolaerne
+
+Det er litt få GT-punkter her, men har laget en modell likevel. Etter kommunikasjon med Kasper (HAN) har jeg konkludert med at det vil være vanskelig å supplere med punkter tilsvarende det vi har gjort for Akerøya. Oppløsningen på dronebildene fra Bolærne er dårligere, og det vil være vanskelig å se hva som faktisk er avbildet av arter. 
+
+En dårlig modell basert på få data er kanskje bedre enn ingenting nå i første omgang... ? Litt skeptisk til å gi fra oss denne. Det er ikke foretatt noen ordentlig validering av denne. Tilsynelatende treffer den godt, men jeg er veldig usikker. Kunne vært validert ved å kjøre en form for kryssvalidering med bootstrap? Men det vil ta for lang tid nå.
+
+Har også kombinert data fra Bolærne med fullt datasett fra Akerøya og laget en felles modell. Denne er testet på et lite utsnitt av Akerøya - se mappen Utsnitt A. Ikke laget prediksjonskart for Bolærne basert på denne. Testen av Akerøya-modellen på Bolærne ga dårlig resultat, så det er vel grunn til å være litt skeptisk her også...
+
+# Heldekkende klassifisering av bilder.
+
+## Akerøya 
+
+Refitter modell med alle data fra Akerøya, predikerer ut til bilder. 
+**Får feilmelding som jeg tror betyr at det er en feil i skriving til fila ett eller annet sted. Får åpnet i QGIS, og ser at det er fornuftige verdier i lagene, men får feilmelding innimellom. Filen er også veldig stor (33,9 GB). Mulige veier videre:**
+
+- [x] Åpne i GRASS
+- [ ] Prediker til mindre utsnitt av gangen
+- [ ] Hvis det er et minneproblem: Forsøk å kjøre på SeaBee-maskina med større block-size
+- [x] Spør James?
+
+Etter å ha spurt James, reduserte jeg bit-dybden på prediksjonslaget til 8bit. Det gikk *ikke* fortere å predikere, men filstørrelsen blir mye mindre (ca 8,5 GB). Prediksjonene kan gå fortere om bitdybden på input-lag også reduseres, men da vil noe informasjon gå tapt (sannsynligvis ikke viktig). Det går kanskje også an å justere litt på chunk-size i tillegg til minne tilgjengelig for rasterpakka i rasterOptions(). Dette vil kunne bli viktig i videre metodeutvikling, fordi det vil kunne reduserer ressursbruken betraktelig.
+
+Jobber nå med å polygonisere rasterlaget med kategorier i GRASS. Det ser ut til å ta veldig lang tid (har holdt på i ca 5 timer). Kanskje vil det kunne gå fortere i QGIS? Jepp. Det gikk fortere i QGIS, men filene blir veldig store. Har besluttet at det beste er å kun levere rasterprodukter.
+

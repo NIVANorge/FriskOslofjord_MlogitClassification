@@ -34,3 +34,15 @@ vignettes/*.pdf
 # Temporary files created by R markdown
 *.utf8.md
 *.knit.md
+
+# Dronebilder and predictions (large files)
+/Dronebilder
+/Predictions
+/Tempfiles
+/ML Predictions James
+/Utsnitt A
+
+# QGIS
+FriskOslofjordKart.qgz
+FriskOslofjordKart.qgz
+QGIS stuff
