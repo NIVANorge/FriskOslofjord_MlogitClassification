@@ -24,7 +24,7 @@ model_data <- read.csv("./Models/model_data.csv")
 summary(model_data)
 
 # Drone images - local
-imagepath <- "C:/RProjects/DroneFriskOslofjord/Dronebilder/reflectance"
+imagepath <- "./Dronebilder/reflectance"
 dir(imagepath)
 
 imagefilelist <- list.files(path = imagepath, pattern = ".tif$")  # ramser alle filer med .tif
@@ -218,7 +218,7 @@ plot(catmap)
 gc()
 
 names(predr)
-gsub("_", " ", names(predr))
+gsub("\\.", " ", names(predr))
 
 brownalgae = c("Bladder.wrack", "Brown.algae", "Fucus.serratus.", "Fucus.vesiculosus")
 
@@ -226,6 +226,8 @@ brownalgae = c("Bladder.wrack", "Brown.algae", "Fucus.serratus.", "Fucus.vesicul
 categories <- data.frame(CatID = c(1:16), Category = names(predr)) %>% 
   mutate(Col_cat = ifelse(Category %in% brownalgae, "Brown algae", gsub("\\.", " ", Category)))
 categories
+
+write.csv(categories, file = "./Leveranse/KategorierRaster.csv")
 
 newcat <- data.frame(Col_cat = unique(categories$Col_cat), NewID = seq_along(along.with = unique(categories$Col_cat)))
 newcat
